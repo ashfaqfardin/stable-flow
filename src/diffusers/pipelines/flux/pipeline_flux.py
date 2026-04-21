@@ -77,6 +77,26 @@ def calculate_shift(
     return mu
 
 
+def get_low_pass_filter_mask(latent_shape, radius, device):
+    # latent_shape is (B, L, D) for Flux's packed latents, 
+    # but we need (B, C, H, W) for FFT. 
+    # However, let's assume it's called after unpacking or we handle dimensions inside.
+    # The instruction says: "latent_shape, radius, device"
+    # and "mask = mask.unsqueeze(0).unsqueeze(0)" which implies it expects H, W.
+    
+    _, _, h, w = latent_shape
+    center_x, center_y = w // 2, h // 2
+    Y, X = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
+    dist_from_center = torch.sqrt((X - center_x)**2 + (Y - center_y)**2)
+    
+    # Create a mask where 1 = low frequencies (center), 0 = high frequencies
+    mask = (dist_from_center <= radius).float()
+    
+    # Reshape to match latent dimensions (Batch, Channels, H, W)
+    mask = mask.unsqueeze(0).unsqueeze(0) 
+    return mask
+
+
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
     scheduler,
@@ -686,7 +706,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         if invert_image:
             timesteps = reversed(timesteps)
-            result_latent_list = []
+            source_latents_trajectory = {}
 
         if percentage_of_steps != 1:
             end_timestep_idx = int(len(timesteps) * percentage_of_steps)
@@ -736,12 +756,31 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 if invert_image:
                     # compute the next noisy sample x_t-1 -> x_t
                     latents = self.scheduler.step_forward(noise_pred, t, latents, return_dict=False)[0]
-                    result_latent_list.append(latents)
+                    source_latents_trajectory[t.item()] = latents.clone().detach()
                 else:
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-                    if inverted_latent_list is not None:
-                        latents[0] = inverted_latent_list[-i][0]
+                    
+                    # Latent Frequency Filtering
+                    if inverted_latent_list is not None and t.item() in inverted_latent_list:
+                        # 1. Unpack latents to (B, C, H, W) for FFT
+                        x_edit = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+                        x_source = self._unpack_latents(inverted_latent_list[t.item()], height, width, self.vae_scale_factor)
+                        
+                        # 2. Generate mask
+                        mask = get_low_pass_filter_mask(x_edit.shape, radius=12, device=x_edit.device)
+                        
+                        # 3. Frequency domain swap
+                        fft_edit = torch.fft.fftshift(torch.fft.fft2(x_edit, norm="ortho"))
+                        fft_source = torch.fft.fftshift(torch.fft.fft2(x_source, norm="ortho"))
+                        
+                        fft_blended = (mask * fft_source) + ((1.0 - mask) * fft_edit)
+                        
+                        # 4. Back to spatial domain
+                        x_edit = torch.fft.ifft2(torch.fft.ifftshift(fft_blended), norm="ortho").real
+                        
+                        # 5. Pack latents back to (B, L, D)
+                        latents = self._pack_latents(x_edit, latents.shape[0], x_edit.shape[1], x_edit.shape[2], x_edit.shape[3])
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
@@ -776,7 +815,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         self.maybe_free_model_hooks()
 
         if invert_image:
-            return result_latent_list
+            return source_latents_trajectory
 
         if not return_dict:
             return (image,)

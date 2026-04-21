@@ -7,8 +7,8 @@ import numpy as np
 from PIL import Image
 
 class StableFlow:
-    MULTIMODAL_VITAL_LAYERS = [0, 1, 17, 18]
-    SINGLE_MODAL_VITAL_LAYERS = list(np.array([28, 53, 54, 56, 25]) - 19) 
+    MULTIMODAL_VITAL_LAYERS = []
+    SINGLE_MODAL_VITAL_LAYERS = []
 
     def __init__(self):
         self._parse_args()
@@ -87,7 +87,7 @@ class StableFlow:
     def invert_and_save(self, prompts):
         inversion_prompt = prompts[0:1]
         # Invert
-        inverted_latent_list = self.pipe(
+        inverted_latent_trajectory = self.pipe(
             inversion_prompt,
             height=1024,
             width=1024,
@@ -99,6 +99,10 @@ class StableFlow:
             invert_image=True
         )
 
+        # Get the starting latent for generation (the last one from inversion)
+        last_t = max(inverted_latent_trajectory.keys())
+        start_latent = inverted_latent_trajectory[last_t]
+
         # Edit
         images = self.pipe(
             prompts,
@@ -108,8 +112,8 @@ class StableFlow:
             output_type="pil",
             num_inference_steps=50,
             max_sequence_length=512,
-            latents=inverted_latent_list[-1].tile(len(prompts), 1, 1),
-            inverted_latent_list=inverted_latent_list,
+            latents=start_latent.tile(len(prompts), 1, 1),
+            inverted_latent_list=inverted_latent_trajectory,
             mm_copy_blocks=StableFlow.MULTIMODAL_VITAL_LAYERS,
             single_copy_blocks=StableFlow.SINGLE_MODAL_VITAL_LAYERS,
         ).images
