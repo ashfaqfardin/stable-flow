@@ -763,9 +763,9 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                     
                     # Latent Frequency Filtering
                     if inverted_latent_list is not None and t.item() in inverted_latent_list:
-                        # 1. Unpack latents to (B, C, H, W) for FFT
-                        x_edit = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-                        x_source = self._unpack_latents(inverted_latent_list[t.item()], height, width, self.vae_scale_factor)
+                        # 1. Unpack latents to (B, C, H, W) for FFT and cast to float32 to avoid ComplexHalf issues
+                        x_edit = self._unpack_latents(latents, height, width, self.vae_scale_factor).to(torch.float32)
+                        x_source = self._unpack_latents(inverted_latent_list[t.item()], height, width, self.vae_scale_factor).to(torch.float32)
                         
                         # 2. Generate mask
                         mask = get_low_pass_filter_mask(x_edit.shape, radius=12, device=x_edit.device)
@@ -776,8 +776,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                         
                         fft_blended = (mask * fft_source) + ((1.0 - mask) * fft_edit)
                         
-                        # 4. Back to spatial domain
-                        x_edit = torch.fft.ifft2(torch.fft.ifftshift(fft_blended), norm="ortho").real
+                        # 4. Back to spatial domain and original dtype
+                        x_edit = torch.fft.ifft2(torch.fft.ifftshift(fft_blended), norm="ortho").real.to(latents.dtype)
                         
                         # 5. Pack latents back to (B, L, D)
                         latents = self._pack_latents(x_edit, latents.shape[0], x_edit.shape[1], x_edit.shape[2], x_edit.shape[3])
