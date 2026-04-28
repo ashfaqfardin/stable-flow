@@ -71,7 +71,10 @@ class StableFlow:
         image = self.pipe.image_processor.preprocess(image).type(self.pipe.vae.dtype).to("cuda")
         latents = self.pipe.vae.encode(image)["latent_dist"].mean
         latents = (latents - self.pipe.vae.config.shift_factor) * self.pipe.vae.config.scaling_factor
-        latents = latents * latent_nudging_scalar
+        
+        from diffusers.pipelines.flux.pipeline_flux import apply_adaptive_nudge
+        latents = apply_adaptive_nudge(latents.to(torch.float32), latent_nudging_scalar).to(latents.dtype)
+        
         latents = self.pipe._pack_latents(
             latents=latents,
             batch_size=1,

@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
 from ...image_processor import VaeImageProcessor
@@ -77,24 +78,43 @@ def calculate_shift(
     return mu
 
 
-def get_low_pass_filter_mask(latent_shape, radius, device):
-    # latent_shape is (B, L, D) for Flux's packed latents, 
-    # but we need (B, C, H, W) for FFT. 
-    # However, let's assume it's called after unpacking or we handle dimensions inside.
-    # The instruction says: "latent_shape, radius, device"
-    # and "mask = mask.unsqueeze(0).unsqueeze(0)" which implies it expects H, W.
+def get_scheduled_soft_mask(shape, timestep, total_steps, device):
+    batch, channels, h, w = shape
     
-    _, _, h, w = latent_shape
-    center_x, center_y = w // 2, h // 2
-    Y, X = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
-    dist_from_center = torch.sqrt((X - center_x)**2 + (Y - center_y)**2)
+    # 1. Linear Schedule: Radius shrinks as we move from t=1 (noise) to t=0 (image)
+    # Early steps (t close to 1) = Large radius (preserve layout)
+    # Late steps (t close to 0) = Small radius (allow texture/detail)
+    progress = timestep / total_steps # assumes t goes from total_steps down to 0
+    max_radius = min(h, w) // 4
+    current_radius = max_radius * progress 
     
-    # Create a mask where 1 = low frequencies (center), 0 = high frequencies
-    mask = (dist_from_center <= radius).float()
+    # 2. Create Base Mask
+    Y, X = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
+    dist = torch.sqrt((X - w//2)**2 + (Y - h//2)**2).to(device)
+    mask = (dist <= current_radius).float()
     
-    # Reshape to match latent dimensions (Batch, Channels, H, W)
-    mask = mask.unsqueeze(0).unsqueeze(0) 
+    # 3. Soften the edges (Gaussian Blur) to prevent ringing artifacts
+    # A kernel size of 5 or 7 usually suffices
+    mask = mask.unsqueeze(0).unsqueeze(0)
+    mask = F.avg_pool2d(mask, kernel_size=5, stride=1, padding=2)
+    
     return mask
+
+
+def apply_adaptive_nudge(z, base_lambda=1.15):
+    # FFT
+    f_z = torch.fft.fftshift(torch.fft.fft2(z, norm="ortho"))
+    
+    # Identify high-frequency areas to nudge harder
+    # We use a small static radius for the nudge-map
+    low_freq_mask = get_scheduled_soft_mask(z.shape, 1, 1, z.device)
+    high_freq_mask = 1.0 - low_freq_mask
+    
+    # Apply nudge: High frequencies get 1.2x, Low get 1.15x
+    nudge_map = base_lambda + (high_freq_mask * 0.05)
+    f_z_nudged = f_z * nudge_map
+    
+    return torch.fft.ifft2(torch.fft.ifftshift(f_z_nudged), norm="ortho").real
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
@@ -767,8 +787,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                         x_edit = self._unpack_latents(latents, height, width, self.vae_scale_factor).to(torch.float32)
                         x_source = self._unpack_latents(inverted_latent_list[t.item()], height, width, self.vae_scale_factor).to(torch.float32)
                         
-                        # 2. Generate mask
-                        mask = get_low_pass_filter_mask(x_edit.shape, radius=12, device=x_edit.device)
+                        # 2. Get the soft mask for this specific timestep
+                        mask = get_scheduled_soft_mask(x_edit.shape, len(timesteps)-i, len(timesteps), x_edit.device)
                         
                         # 3. Frequency domain swap
                         fft_edit = torch.fft.fftshift(torch.fft.fft2(x_edit, norm="ortho"))
